@@ -14,7 +14,6 @@
 
 
 import contextlib
-import hashlib
 import html
 import json
 import logging
@@ -23,9 +22,12 @@ import re
 import os
 import sys
 import time
+import string
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+from mutagen.id3 import ID3,TRCK,TIT2,TALB,TPE1,APIC,TCON
 from enum import Enum
 
 import gi
@@ -59,10 +61,9 @@ except AttributeError:
     RESAMPLER_QUALITY_MAX = 10
     RESAMPLER_FILTER_MODE_FULL = 1
 
-ALBUM_ART_SIZE = 96
+ALBUM_ART_SIZE = 96 # size that is displayed
+ALBUM_ART_FULL_SIZE = 300 # size that is stored in memory and saved to mp3
 TEXT_X_PADDING = 12
-# 15 days in seconds to retain album art files.
-ART_CACHE_TIME = 1.296e+6
 
 FALLBACK_BLACK = Gdk.RGBA(red=0.0, green=0.0, blue=0.0, alpha=1.0)
 FALLBACK_WHITE = Gdk.RGBA(red=1.0, green=1.0, blue=1.0, alpha=1.0)
@@ -78,6 +79,12 @@ style="fill:{bg}" /></g></svg>
 BACKGROUND_SVG = '''
 <svg><rect y="0" x="0" height="{px}" width="{px}" style="fill:{fg}" /></svg>
 '''
+
+def clean_name(s):
+    # for windows you can do this:
+    #valid_chars = "-_.() %s%s" % (string.ascii_letters, string.digits)
+    #return ''.join(c if c in valid_chars else '-' for c in s.strip())
+    return s.strip().replace("/","-")
 
 class PseudoGst(Enum):
     """Create aliases to Gst.State so that we can add our own BUFFERING Pseudo state"""
@@ -122,7 +129,8 @@ class CellRendererAlbumArt(Gtk.CellRenderer):
         return getattr(self, pspec.name)
     def do_render(self, ctx, widget, background_area, cell_area, flags):
         if self.pixbuf is not None:
-            Gdk.cairo_set_source_pixbuf(ctx, self.pixbuf, cell_area.x, cell_area.y)
+            gui_pixbuf=self.pixbuf.scale_simple(ALBUM_ART_SIZE,ALBUM_ART_SIZE, GdkPixbuf.InterpType.BILINEAR) # scaled down pixbuf
+            Gdk.cairo_set_source_pixbuf(ctx, gui_pixbuf, cell_area.x, cell_area.y)
             ctx.paint()
         else:
             Gdk.cairo_set_source_pixbuf(ctx, self.background, cell_area.x, cell_area.y)
@@ -178,7 +186,7 @@ class CellRendererAlbumArt(Gtk.CellRenderer):
         bg_rgb = bg_color.to_string()
 
         # Use our color values to create strings representing valid SVG's
-        # for background and rate_bg, then load them with PixbufLoader.
+        # for backgound and rate_bg, then load them with PixbufLoader.
         background = BACKGROUND_SVG.format(px=ALBUM_ART_SIZE, fg=fg_rgb).encode()
         rating_bg = RATING_BG_SVG.format(bg=bg_rgb).encode()
 
@@ -301,6 +309,62 @@ class PithosWindow(Gtk.ApplicationWindow):
         self._query_buffer = Gst.Query.new_buffering(Gst.Format.PERCENT)
 
         self.player = Gst.ElementFactory.make("playbin", "player")
+
+        ############################################################################################
+
+        # split the stream out for saving
+        split = Gst.ElementFactory.make("tee")
+        sink_bin = Gst.Bin()
+        sink_bin.add(split)
+        sink_bin.add_pad(Gst.GhostPad.new("sink", split.get_static_pad("sink")))
+        self.player.set_property("audio-sink", sink_bin) # comment out this line to switch back to not saving the stream
+
+        qrep = Gst.ElementFactory.make("queue")
+        rep = Gst.ElementFactory.make("autoaudiosink")
+        sink_bin.add(qrep)
+        sink_bin.add(rep)
+        split.link(qrep)
+        qrep.link(rep)
+
+        # http://gstreamer.freedesktop.org/documentation/plugins.html
+        qfs = Gst.ElementFactory.make("queue")
+        enc = Gst.ElementFactory.make("lamemp3enc") # vorbisenc
+        # constant bit rate
+        enc.set_property("cbr", True) # constant bitrate
+        enc.set_property("target",1) # target bitrate, 0 to target quality and then bitrate does not mater
+        enc.set_property("bitrate",128) # incoming stream is 64 bit AAC+, so we upconvert to 128 to get every bit out of ut. Could user 192 or even 224 for pandora one subsribers
+        # for VBR use the following:
+        #enc.set_property("cbr",False)
+        #enc.set_property("target",0) # 0 to target quality and then bitrate does not mater
+        #enc.set_property("quality",1) # 0 to 10. 0 is the best
+        enc.set_property("encoding-engine-quality",2) # 2 high quality. 0 fast, 1 standard
+
+        # need the tagger to start the stream with an ID3 tag frame for later mutagen consumption
+        self.tag = Gst.ElementFactory.make("id3v2mux") #vorbistag
+
+        # for ogg vorbis do
+        #enc = Gst.ElementFactory.make("lamemp3enc") # vorbisenc
+        #tag = Gst.ElementFactory.make("id3v2mux") #vorbistag
+        #mux = Gst.ElementFactory.make("oggmux")
+        self.fs = Gst.ElementFactory.make("filesink")
+        self.fs.set_property("location", "test.file") #dummy location
+        self.fs.set_property("async",False)
+
+        sink_bin.add(qfs)
+        sink_bin.add(enc)
+        sink_bin.add(self.tag)
+        #sink_bin.add(mux)
+        sink_bin.add(self.fs)
+        split.link(qfs)
+        qfs.link(enc)
+        enc.link(self.tag)
+        # for ogg vorbis extend the chain
+        #self.tag.link(mux)
+        #mux.link(self.fs)
+        self.tag.link(self.fs)
+
+        ############################################################################################
+
         self.player.set_property('buffer-duration', 3 * Gst.SECOND)
         self.rgvolume = Gst.ElementFactory.make("rgvolume", "rgvolume")
         self.rgvolume.set_property("album-mode", False)
@@ -367,13 +431,12 @@ class PithosWindow(Gtk.ApplicationWindow):
         self.worker = GObjectWorker()
 
         try:
-            tempdir_base = '/var/tmp' # Preferred over /tmp as lots of icons can be large in size.
+            tempdir_base = '/var/tmp' # Prefered over /tmp as lots of icons can be large in size.
             if is_flatpak():
                 # However in flatpak that path is not readable by the host.
                 tempdir_base = os.path.join(GLib.get_user_cache_dir(), 'tmp')
-            self.tempdir = os.path.join(tempdir_base, 'pithos_cache')
-            os.makedirs(self.tempdir, exist_ok=True)
-            logging.info("Created temporary directory {}".format(self.tempdir))
+            self.tempdir = tempfile.TemporaryDirectory(prefix='pithos-', dir=tempdir_base)
+            logging.info("Created temporary directory {}".format(self.tempdir.name))
         except IOError as e:
             self.tempdir = None
             logging.warning('Failed to create a temporary directory: {}'.format(e))
@@ -771,7 +834,22 @@ class PithosWindow(Gtk.ApplicationWindow):
         self.emit('song-changed', song)
         self.emit('metadata-changed', song)
 
+        # split save to a file
+        #self.buffer_percent = 100
+        # set output file
+        self.outfolder="~/Music/"
+        if not os.path.exists(self.outfolder):
+            os.makedirs(self.outfolder)
+        self.fs.set_property("location", "%s/%s - %s.partial" % (self.outfolder,clean_name(self.current_song.artist),clean_name(self.current_song.title)))
+        # tags are set through mutagen but could use the following to set tags through gstreamer
+        # http://www.freedesktop.org/software/gstreamer-sdk/data/docs/2012.5/gstreamer-0.10/GstTagSetter.html
+        #self.tag.gst_tag_setter_add_tag_values("artist")
+        #self.tag.gst_tag_setter_add_tag_values("title")
+
     def next_song(self, *ignore):
+        if self.fs.get_property("location") is not None and os.path.isfile(self.fs.get_property("location")):
+            os.remove(self.fs.get_property("location"))    # remove the partial file
+
         if self.current_song_index is not None:
             self.start_song(self.current_song_index + 1)
 
@@ -824,6 +902,9 @@ class PithosWindow(Gtk.ApplicationWindow):
 
 
     def stop(self):
+        if self.fs.get_property("location") is not None and os.path.isfile(self.fs.get_property("location")):
+            os.remove(self.fs.get_property("location"))    # remove the partial file on station switch, app exit etc which causes the song to "stop" midstream
+
         prev = self.current_song
         if prev and prev.start_time:
             prev.finished = True
@@ -850,15 +931,6 @@ class PithosWindow(Gtk.ApplicationWindow):
             self.user_pause()
         else:
             self.user_play()
-
-    def clear_art_cache(self):
-        logging.info('Checking for expired art in cache')
-        timestamp = time.time()
-        with os.scandir(self.tempdir) as art_list:
-            for art in art_list:
-                age = timestamp - art.stat().st_mtime
-                if age > ART_CACHE_TIME:
-                    os.remove(os.path.join(self.tempdir, art.path))
 
     def get_playlist(self, start = False):
         if self.playlist_update_timer_id:
@@ -889,21 +961,16 @@ class PithosWindow(Gtk.ApplicationWindow):
                 return (None, None,) + extra
 
             file_url = None
-            song, index = extra
             if tmpdir:
                 try:
-                    self.clear_art_cache()
-                    filename_hash = hashlib.sha256((song.artist+song.album).encode('utf-8')).hexdigest()+'.jpeg'
-                    cache_file_path = os.path.join(self.tempdir, filename_hash)
-                    file_url = urllib.parse.urljoin('file://', urllib.parse.quote(cache_file_path))
-                    if not os.path.exists(cache_file_path):
-                        with open(cache_file_path, 'xb') as f:
-                            f.write(image)
+                    with tempfile.NamedTemporaryFile(prefix='art-', suffix='.jpeg', dir=tmpdir.name, delete=False) as f:
+                        f.write(image)
+                        file_url = urllib.parse.urljoin('file://', urllib.parse.quote(f.name))
                 except IOError:
                     logging.warning("Failed to write art tempfile")
 
             with contextlib.closing(GdkPixbuf.PixbufLoader()) as loader:
-                loader.set_size(ALBUM_ART_SIZE, ALBUM_ART_SIZE)
+                loader.set_size(ALBUM_ART_FULL_SIZE, ALBUM_ART_FULL_SIZE)
                 loader.write(image)
             return (loader.get_pixbuf(), file_url,) + extra
 
@@ -1085,7 +1152,7 @@ class PithosWindow(Gtk.ApplicationWindow):
             return True
 
     def on_gst_stream_start(self, bus, message):
-        # Edge case. We might get this signal while we're reconnecting to Pandora.
+        # Edge case. We might get this singal while we're reconnecting to Pandora.
         # If so self.current_song will be None.
         if self.current_song is None:
             return
@@ -1093,12 +1160,35 @@ class PithosWindow(Gtk.ApplicationWindow):
         self.current_song.duration = self.query_duration() or self.current_song.trackLength * Gst.SECOND
         self.current_song.duration_message = self.format_time(self.current_song.duration)
         self.update_song_row()
+        self.check_if_song_is_ad()
         # We can't seek so duration in MPRIS is just for display purposes if it's not off by more than a sec it's OK.
         if self.current_song.get_duration_sec() != self.current_song.trackLength:
             self.emit('metadata-changed', self.current_song)
 
     def on_gst_eos(self, bus, message):
         logging.info("EOS")
+
+        ##########################################################################################
+
+        # move the partial into completed
+        newlocation = "%s/%s - %s.mp3" % (self.outfolder,clean_name(self.current_song.artist),clean_name(self.current_song.title))
+        os.rename(self.fs.get_property("location"),newlocation)
+        # add mp3 tags
+        f=ID3(newlocation)
+        f.add(TIT2(encoding=3, text=self.current_song.title))
+        f.add(TALB(encoding=3, text=self.current_song.album))
+        f.add(TPE1(encoding=3, text=self.current_song.artist))
+        f.add(TCON(encoding=3, text=self.current_station.name))
+        if self.current_song.art_pixbuf is not None:    # add the cover art
+            # convert pure pixelmap to jpeg through file export because python Gtk is missing buffered function implementations
+            self.current_song.art_pixbuf.savev(newlocation+".jpg", "jpeg", ["quality"], ["100"])
+            # get the file contents into the mp3 id2 tag v2.3/2.4 cover art
+            f.add(APIC(3,u"image/jpg",3,u"Cover art",open(newlocation+".jpg", 'rb').read())) # first 3 = mutagen.id3.Encoding.UTF8,  second 3 =mutagen.id3.PictureType.COVER_FRONT
+            os.remove(newlocation+".jpg")
+        f.save()
+
+        ##########################################################################################
+
         self.next_song()
 
     def on_gst_plugin_installed(self, result, userdata):
@@ -1131,22 +1221,36 @@ class PithosWindow(Gtk.ApplicationWindow):
         if not GstPbutils.install_plugins_installation_in_progress():
             self.next_song()
 
+    def check_if_song_is_ad(self):
+        if self.current_song.is_ad is None:
+            if self.current_song.duration:
+                if self.current_song.get_duration_sec() < 45:  # Less than 45 seconds we assume it's an ad
+                    logging.info('Ad detected!')
+                    self.current_song.is_ad = True
+                    self.update_song_row()
+                    self.set_title("Commercial Advertisement - Pithos")
+                else:
+                    logging.info('Not an Ad..')
+                    self.current_song.is_ad = False
+            else:
+                logging.warning('dur_stat is False. The assumption that duration is available once the stream-start messages feeds is bad.')
+
     def on_gst_buffering(self, bus, message):
         # React to the buffer message immediately and also fire a short repeating timeout
         # to check the buffering state that cancels only if we're not buffering or there's a pending timeout.
         # This will insure we don't get stuck in a buffering state if we're really not buffering.
 
-        self.react_to_buffering_message(False)
+        self.react_to_buffering_mesage(False)
 
         if self.buffering_timer_id:
             GLib.source_remove(self.buffering_timer_id)
             self.buffering_timer_id = 0
-        self.buffering_timer_id = GLib.timeout_add(200, self.react_to_buffering_message, True)
+        self.buffering_timer_id = GLib.timeout_add(200, self.react_to_buffering_mesage, True)
 
-    def react_to_buffering_message(self, from_timeout):
+    def react_to_buffering_mesage(self, from_timeout):
         # If the pipeline signals that it is buffering set the player to PseudoGst.BUFFERING
         # (which is an alias to Gst.State.PAUSED). During buffering if the user goes to Pause
-        # or Play(an/or back again) go though all the motions but don't actually change the
+        # or Play(an/or back again) go though all the motions but don't actaully change the
         # player's state to the desired state until buffering has completed. The player only
         # cares about the actual state, the rest of Pithos only cares about our buffer_recovery
         # state, the state we *wish* we were in.
